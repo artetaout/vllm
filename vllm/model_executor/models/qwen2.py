@@ -57,7 +57,7 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, WeightsMapper,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
-
+from transformer_engine import pytorch as te
 logger = init_logger(__name__)
 
 
@@ -228,6 +228,8 @@ class Qwen2DecoderLayer(nn.Module):
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
+        self.te_workspace = te.module.base.get_workspace()
+        self.te_dtype = te.cpp_extensions.DType.kBFloat16
 
     def forward(
         self,
@@ -252,11 +254,40 @@ class Qwen2DecoderLayer(nn.Module):
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        # hidden_states, residual = self.post_attention_layernorm(
+        #     hidden_states, residual)
+        # hidden_states = self.mlp(hidden_states)
+        # return hidden_states, residual
+        residual = hidden_states + residual
+        hidden_states = residual
+        # hidden_states = self.mlp(hidden_states)
+        # return hidden_states, residual
+        output_rmsnorm = te.cpp_extensions.rmsnorm_fwd_inf(
+            *(hidden_states, self.post_attention_layernorm.weight), 
+            eps=1e-6, 
+            sm_margin=0, 
+            zero_centered_gamma=False
+        )
+        output_fc1 = te.cpp_extensions.gemm(
+            self.mlp.gate_up_proj.weight,
+            output_rmsnorm,
+            torch.bfloat16,
+            self.te_workspace
+        )
+        input_fc2 = te.cpp_extensions.swiglu(
+            output_fc1[0],
+            None,
+            te.cpp_extensions.FP8FwdTensors.GEMM2_INPUT,
+            self.te_dtype
+        )
 
+        output_fc2 = te.cpp_extensions.gemm(
+            self.mlp.down_proj.weight,
+            input_fc2,
+            torch.bfloat16,
+            self.te_workspace
+        )
+        return output_fc2[0], residual
 
 @support_torch_compile(
     dynamic_arg_dims={
@@ -292,7 +323,6 @@ class Qwen2Model(nn.Module):
         self.quant_config = quant_config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-
         if get_pp_group().is_first_rank or (config.tie_word_embeddings
                                             and get_pp_group().is_last_rank):
             self.embed_tokens = VocabParallelEmbedding(
